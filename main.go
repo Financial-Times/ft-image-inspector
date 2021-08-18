@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -14,11 +15,11 @@ import (
 	"golang.org/x/net/html/atom"
 )
 
-const basicAuth = "" //"Basic "
 const delay = time.Second
 
+var basicAuth string = ""
+
 // TODO: Add cache
-// TODO: Add TID
 
 type Content struct {
 	UUID      string `json:"uuid"`
@@ -39,12 +40,18 @@ func (c *Content) GetBody() string {
 }
 
 func main() {
+	flag.StringVar(&basicAuth, "auth", "", "base64 encoded auth for the delivery cluster")
+	flag.Parse()
+
+	if len(basicAuth) == 0 {
+		fmt.Print("parameter auth not provided. terminating...\n")
+		os.Exit(-1)
+	}
+
+	fmt.Print("Starting...\n")
 	results := map[string][]string{}
 	broken := []string{}
-	for idx, id := range data {
-		if idx == 100 {
-			break
-		}
+	for _, id := range data {
 		images, err := getImagesForContent(id)
 		if err != nil {
 			fmt.Println(err)
@@ -67,10 +74,17 @@ func main() {
 		}
 		time.Sleep(delay)
 	}
+
 	broken = dedupStrings(broken)
+
 	f, _ := os.Create("broken-images")
 	defer f.Close()
-	f.WriteString(strings.Join(broken, "\n"))
+
+	_, err := f.WriteString(strings.Join(broken, "\n"))
+	if err != nil {
+		fmt.Printf("error: %v\n", err)
+	}
+	fmt.Print("Finished!\n")
 }
 
 var ErrImageSetBroken = errors.New("image set broken")
@@ -133,11 +147,15 @@ func getContentFromDocumentStore(uuid string) (*Content, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Add("Authorization", basicAuth)
+	req.Header.Add("Authorization", "Basic "+basicAuth)
+	req.Header.Add("X-Request-Id", "tid_ftimageinspector_"+uuid)
 
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
+	}
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("error %d", res.StatusCode)
 	}
 	defer res.Body.Close()
 
