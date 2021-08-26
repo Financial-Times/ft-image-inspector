@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	"golang.org/x/net/html"
-	"golang.org/x/net/html/atom"
 )
 
 var (
@@ -20,6 +18,7 @@ var (
 	printOnly   bool   = false
 	docStoreURL string = ""
 	delayInMs   int    = 1000
+	uuidFile    string = ""
 )
 
 type Content struct {
@@ -46,6 +45,7 @@ func main() {
 	flag.BoolVar(&printOnly, "printOnly", false, "do not check but only print article/image uuids")
 	flag.StringVar(&docStoreURL, "docStoreURL", "", "url of the document store service")
 	flag.IntVar(&delayInMs, "delay", 1000, "throttle delay in miliseconds")
+	flag.StringVar(&uuidFile, "uuidFile", "", "json file that holds a list with the uuids to be verified")
 	flag.Parse()
 
 	if len(basicAuth) == 0 {
@@ -58,45 +58,24 @@ func main() {
 		fmt.Print("Printing only uuids without checking images\n")
 	}
 
-	results := map[string][]string{}
+	data, err := loadUUIDList(uuidFile)
+	if err != nil {
+		fmt.Printf("unable to load uuid list %s", err)
+		return
+	}
+
 	broken := []string{}
 	for _, id := range data {
-		if printOnly {
-			fmt.Println(id)
-		}
-		images, err := getImagesForContent(id)
-		if err != nil {
-			fmt.Printf("%s - %s\n", err, id)
-			continue
-		}
-		if images == nil {
-			continue
-		}
-
-		results[id] = dedupStrings(images)
-
-		for _, imageUUID := range results[id] {
-			if printOnly && imageUUID != "" {
-				fmt.Println(imageUUID)
+		err := checkContent(id)
+		if !printOnly {
+			if err != nil {
+				fmt.Printf("broken: %s (%s)\n", id, err)
+				broken = append(broken, id)
 			} else {
-				img, err := checkImage(imageUUID)
-				if err != nil {
-					if errors.Is(err, ErrImageSetBroken) {
-						fmt.Printf("broken: image: %s from image-set: %s article: %s\n", imageUUID, img.UUID, id)
-						broken = append(broken, imageUUID)
-						continue
-					}
-					if errors.Is(err, ErrContentNotPublishedByConverter) {
-						fmt.Printf("content not published by upp-methode-converter. image: %s from image-set %s article: %s\n", imageUUID, img.UUID, id)
-						broken = append(broken, imageUUID)
-						continue
-					}
-					fmt.Printf("error: %v\n", err)
-					continue
-				}
-				fmt.Printf("safe: %s\n", imageUUID)
+				fmt.Printf("safe: %s\n", id)
 			}
 		}
+
 		time.Sleep(time.Duration(delayInMs) * time.Millisecond)
 	}
 
@@ -114,66 +93,92 @@ func main() {
 	fmt.Print("Finished!\n")
 }
 
-var (
-	ErrImageSetBroken                 = errors.New("image set broken")
-	ErrContentNotPublishedByConverter = errors.New("content not published by the upp-methode-converter")
-)
-
-func checkImage(uuid string) (*Content, error) {
-	c, err := getContentFromDocumentStore(uuid)
+func loadUUIDList(fileName string) ([]string, error) {
+	uuidFile, err := os.Open(fileName)
 	if err != nil {
 		return nil, err
 	}
-	switch c.Type {
-	case "Image", "ImageSet", "Graphic":
-		break
-	default:
-		return nil, fmt.Errorf("error: %s unexpected type %s", uuid, c.Type)
-	}
+	defer uuidFile.Close()
 
-	if !strings.Contains(c.PublishReference, "tid_methode_carousel_") {
-		return c, ErrContentNotPublishedByConverter
-	}
-
-	// if its not Image Set probably not broken
-	if c.Type != "ImageSet" {
-		return c, nil
-	}
-	// if it has more than one members - not broken
-	if len(c.Members) != 1 {
-		return c, nil
-	}
-	memberUUID := c.Members[0].UUID
-	m, err := getContentFromDocumentStore(memberUUID)
+	uuidValues, err := ioutil.ReadAll(uuidFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get member '%s' for '%s': %w", memberUUID, uuid, err)
+		return nil, err
 	}
-	for _, inM := range m.Members {
-		if inM.UUID == memberUUID {
-			return m, ErrImageSetBroken
-		}
+
+	var uuids []string
+	err = json.Unmarshal(uuidValues, &uuids)
+	if err != nil {
+		return nil, err
 	}
-	// nothing broken in this ImageSet
-	return c, nil
+
+	return uuids, nil
 }
 
-func getImagesForContent(uuid string) ([]string, error) {
+func checkContent(uuid string) error {
 	c, err := getContentFromDocumentStore(uuid)
 	if err != nil {
-		//fmt.Printf("error: %v\n", err)
-		return nil, err
-	}
-	if c.Type != "Article" {
-		return nil, nil
+		if printOnly {
+			fmt.Printf("unable to find content with %s in the document-store\n", uuid)
+		}
+		return err
 	}
 
-	images, err := getImageSetFromBody(c)
-	if err != nil {
-		fmt.Printf("body img error: %v\n", err)
-		return nil, err
+	if (!printOnly) && (!strings.Contains(c.PublishReference, "tid_methode_carousel_")) {
+		return fmt.Errorf("content %s not published by the upp-methode-converter", uuid)
 	}
-	images = append(images, c.MainImage)
-	return images, nil
+
+	switch c.Type {
+	case "Image", "Graphic":
+		if printOnly {
+			fmt.Println(uuid)
+		}
+		return nil //Being able to load the content with the correct tid is OK
+	case "ImageSet":
+		return checkImageSet(c)
+	case "Article":
+		if printOnly {
+			fmt.Println(uuid)
+		}
+		return checkArticle(c)
+	default:
+		return fmt.Errorf("error: %s unexpected type %s", uuid, c.Type)
+	}
+}
+
+func checkArticle(c *Content) error {
+	imageSets, err := getImageSetFromBody(c)
+	if err != nil {
+		return err
+	}
+
+	imageSets = dedupStrings(imageSets)
+	for _, imgSet := range imageSets {
+		err = checkContent(imgSet)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func checkImageSet(c *Content) error {
+	for _, member := range c.Members {
+		if c.UUID == member.UUID {
+			if printOnly {
+				continue
+			} else {
+				return fmt.Errorf("cycle reference detected in image set %s", c.UUID)
+			}
+		}
+
+		err := checkContent(member.UUID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func getContentFromDocumentStore(uuid string) (*Content, error) {
@@ -215,12 +220,7 @@ func getImageSetFromBody(c *Content) ([]string, error) {
 	}
 
 	bodyReader := strings.NewReader(bodyAsString)
-	//using ParseFragment since Parse will construct a well-formed HTML by introducing <HTML> element
-	htmlDoc, err := html.ParseFragment(bodyReader, &html.Node{
-		Type:     html.ElementNode,
-		Data:     "body",
-		DataAtom: atom.Body,
-	})
+	htmlDoc, err := html.Parse(bodyReader)
 	if err != nil {
 		return nil, err
 	}
@@ -229,39 +229,48 @@ func getImageSetFromBody(c *Content) ([]string, error) {
 	return images, nil
 }
 
-func collectImageSets(nodeList []*html.Node) []string {
-	var images []string
-	for _, node := range nodeList {
-		if node.Type == html.ElementNode && (node.Data == "ft-content" || node.Data == "content") {
-			hasImageSet := false
-			for _, attr := range node.Attr {
-				if attr.Key == "type" && attr.Val == "http://www.ft.com/ontology/content/ImageSet" {
-					hasImageSet = true
-					break
-				}
-			}
-			for _, attr := range node.Attr {
-				if !hasImageSet {
-					break
-				}
-				if attr.Key == "url" {
-					imageUUID := extractUUIDfromURL(attr.Val)
-					images = append(images, imageUUID)
-					break
-				}
-				if attr.Key == "id" {
-					images = append(images, attr.Val)
-					break
-				}
-			}
-		}
+func collectImageSets(node *html.Node) []string {
+	var imageSets []string
 
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			imgs := collectImageSets([]*html.Node{child})
-			images = append(images, imgs...)
+	if node.Type == html.ElementNode && (node.Data == "ft-content" || node.Data == "content") {
+		for _, attr := range node.Attr {
+			if attr.Key == "type" && attr.Val == "http://www.ft.com/ontology/content/ImageSet" {
+				imageSets = parseImageSets(imageSets, node)
+			}
 		}
 	}
+
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		imgs := collectImageSets(child)
+		imageSets = append(imageSets, imgs...)
+	}
+
+	return imageSets
+}
+
+func parseImageSets(images []string, node *html.Node) []string {
+	urlAttr := findNodeAttributeByKey(node.Attr, "url")
+	if urlAttr != nil {
+		imageUUID := extractUUIDfromURL(urlAttr.Val)
+		images = append(images, imageUUID)
+	}
+
+	idAttr := findNodeAttributeByKey(node.Attr, "id")
+	if idAttr != nil {
+		images = append(images, idAttr.Val)
+	}
+
 	return images
+}
+
+func findNodeAttributeByKey(attr []html.Attribute, key string) *html.Attribute {
+	for _, a := range attr {
+		if a.Key == key {
+			return &a
+		}
+	}
+
+	return nil
 }
 
 func extractUUIDfromURL(URL string) string {
