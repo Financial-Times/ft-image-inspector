@@ -15,11 +15,12 @@ import (
 	"golang.org/x/net/html/atom"
 )
 
-const delay = time.Second
-
-var basicAuth string = ""
-
-// TODO: Add cache
+var (
+	basicAuth   string = ""
+	printOnly   bool   = false
+	docStoreURL string = ""
+	delayInMs   int    = 1000
+)
 
 type Content struct {
 	UUID      string `json:"uuid"`
@@ -28,19 +29,23 @@ type Content struct {
 	Members   []struct {
 		UUID string `json:"uuid"`
 	} `json:"members"`
-	Body    string `json:"body"`
-	BodyXml string `json:"bodyXML"`
+	Body             string `json:"body"`
+	BodyXML          string `json:"bodyXML"`
+	PublishReference string `json:"publishReference"`
 }
 
 func (c *Content) GetBody() string {
 	if c.Body != "" {
 		return c.Body
 	}
-	return c.BodyXml
+	return c.BodyXML
 }
 
 func main() {
 	flag.StringVar(&basicAuth, "auth", "", "base64 encoded auth for the delivery cluster")
+	flag.BoolVar(&printOnly, "printOnly", false, "do not check but only print article/image uuids")
+	flag.StringVar(&docStoreURL, "docStoreURL", "", "url of the document store service")
+	flag.IntVar(&delayInMs, "delay", 1000, "throttle delay in miliseconds")
 	flag.Parse()
 
 	if len(basicAuth) == 0 {
@@ -49,45 +54,70 @@ func main() {
 	}
 
 	fmt.Print("Starting...\n")
+	if printOnly {
+		fmt.Print("Printing only uuids without checking images\n")
+	}
+
 	results := map[string][]string{}
 	broken := []string{}
 	for _, id := range data {
+		if printOnly {
+			fmt.Println(id)
+		}
 		images, err := getImagesForContent(id)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Printf("%s - %s\n", err, id)
 			continue
 		}
+		if images == nil {
+			continue
+		}
+
 		results[id] = dedupStrings(images)
 
 		for _, imageUUID := range results[id] {
-			img, err := checkImage(imageUUID)
-			if err != nil {
-				if errors.Is(err, ErrImageSetBroken) {
-					fmt.Printf("bronken: %s from %s\n", imageUUID, img.UUID)
-					broken = append(broken, imageUUID)
+			if printOnly && imageUUID != "" {
+				fmt.Println(imageUUID)
+			} else {
+				img, err := checkImage(imageUUID)
+				if err != nil {
+					if errors.Is(err, ErrImageSetBroken) {
+						fmt.Printf("broken: image: %s from image-set: %s article: %s\n", imageUUID, img.UUID, id)
+						broken = append(broken, imageUUID)
+						continue
+					}
+					if errors.Is(err, ErrContentNotPublishedByConverter) {
+						fmt.Printf("content not published by upp-methode-converter. image: %s from image-set %s article: %s\n", imageUUID, img.UUID, id)
+						broken = append(broken, imageUUID)
+						continue
+					}
+					fmt.Printf("error: %v\n", err)
 					continue
 				}
-				fmt.Printf("error: %v\n", err)
-				continue
+				fmt.Printf("safe: %s\n", imageUUID)
 			}
-			fmt.Printf("safe: %s\n", imageUUID)
 		}
-		time.Sleep(delay)
+		time.Sleep(time.Duration(delayInMs) * time.Millisecond)
 	}
 
-	broken = dedupStrings(broken)
+	if !printOnly {
+		broken = dedupStrings(broken)
+		f, _ := os.Create("broken-images")
+		defer f.Close()
 
-	f, _ := os.Create("broken-images")
-	defer f.Close()
-
-	_, err := f.WriteString(strings.Join(broken, "\n"))
-	if err != nil {
-		fmt.Printf("error: %v\n", err)
+		_, err := f.WriteString(strings.Join(broken, "\n"))
+		if err != nil {
+			fmt.Printf("error: %v\n", err)
+		}
 	}
+
 	fmt.Print("Finished!\n")
 }
 
-var ErrImageSetBroken = errors.New("image set broken")
+var (
+	ErrImageSetBroken                 = errors.New("image set broken")
+	ErrContentNotPublishedByConverter = errors.New("content not published by the upp-methode-converter")
+)
 
 func checkImage(uuid string) (*Content, error) {
 	c, err := getContentFromDocumentStore(uuid)
@@ -100,6 +130,11 @@ func checkImage(uuid string) (*Content, error) {
 	default:
 		return nil, fmt.Errorf("error: %s unexpected type %s", uuid, c.Type)
 	}
+
+	if !strings.Contains(c.PublishReference, "tid_methode_carousel_") {
+		return c, ErrContentNotPublishedByConverter
+	}
+
 	// if its not Image Set probably not broken
 	if c.Type != "ImageSet" {
 		return c, nil
@@ -125,9 +160,13 @@ func checkImage(uuid string) (*Content, error) {
 func getImagesForContent(uuid string) ([]string, error) {
 	c, err := getContentFromDocumentStore(uuid)
 	if err != nil {
-		fmt.Printf("error: %v\n", err)
+		//fmt.Printf("error: %v\n", err)
 		return nil, err
 	}
+	if c.Type != "Article" {
+		return nil, nil
+	}
+
 	images, err := getImageSetFromBody(c)
 	if err != nil {
 		fmt.Printf("body img error: %v\n", err)
@@ -138,7 +177,7 @@ func getImagesForContent(uuid string) ([]string, error) {
 }
 
 func getContentFromDocumentStore(uuid string) (*Content, error) {
-	url := "https://upp-prod-delivery-eu.upp.ft.com/__document-store-api/content/" + uuid
+	url := docStoreURL + uuid
 	method := "GET"
 
 	client := &http.Client{}
