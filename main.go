@@ -19,6 +19,7 @@ var (
 	docStoreURL string = ""
 	delayInMs   int    = 1000
 	uuidFile    string = ""
+	brokenFile  string = ""
 )
 
 type Content struct {
@@ -42,10 +43,11 @@ func (c *Content) GetBody() string {
 
 func main() {
 	flag.StringVar(&basicAuth, "auth", "", "base64 encoded auth for the delivery cluster")
-	flag.BoolVar(&printOnly, "printOnly", false, "do not check but only print article/image uuids")
-	flag.StringVar(&docStoreURL, "docStoreURL", "", "url of the document store service")
+	flag.BoolVar(&printOnly, "printonly", false, "do not check but only print article/image uuids")
+	flag.StringVar(&docStoreURL, "docstoreurl", "", "url of the document store service")
 	flag.IntVar(&delayInMs, "delay", 1000, "throttle delay in miliseconds")
-	flag.StringVar(&uuidFile, "uuidFile", "", "json file that holds a list with the uuids to be verified")
+	flag.StringVar(&uuidFile, "uuidfile", "", "json file that holds a list with the uuids to be verified")
+	flag.StringVar(&brokenFile, "brokenfile", "", "file that will hold the uuid of the broken publications")
 	flag.Parse()
 
 	if len(basicAuth) == 0 {
@@ -79,9 +81,9 @@ func main() {
 		time.Sleep(time.Duration(delayInMs) * time.Millisecond)
 	}
 
-	if !printOnly {
+	if !printOnly && brokenFile != "" {
 		broken = dedupStrings(broken)
-		f, _ := os.Create("broken-images")
+		f, _ := os.Create(brokenFile)
 		defer f.Close()
 
 		_, err := f.WriteString(strings.Join(broken, "\n"))
